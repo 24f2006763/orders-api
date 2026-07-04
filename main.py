@@ -1,89 +1,126 @@
+import os
+import json
 import time
-from typing import Optional, Dict
+from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI()
 
-# Assigned Values
+# --- ASSIGNED CONFIGURATION ---
 TOTAL_ORDERS = 43
 RATE_LIMIT_REQUESTS = 18
 RATE_LIMIT_WINDOW_SECS = 10.0
 
-idempotency_store: Dict[str, str] = {}
-rate_limit_store: Dict[str, list] = {}
+# Fixed path inside Vercel's writable temporary environment
+IDEMPOTENCY_FILE = "/tmp/idempotency_store.json"
+RATELIMIT_FILE = "/tmp/rate_limit_store.json"
+
+# Static catalog generation
 ORDERS_CATALOG = [{"id": i, "item": f"Item {i}", "price": 10.0 + i} for i in range(1, TOTAL_ORDERS + 1)]
 
 class OrderPayload(BaseModel):
     item: Optional[str] = "Item"
     price: Optional[float] = 10.0
 
-# --- CRITICAL FIX: Custom Middleware with structural CORS safety ---
-# --- FIXED CRITICAL MIDDLEWARE FOR RATE LIMITING ---
+# --- PERSISTENT DISK STATE HELPER FUNCTIONS ---
+def load_state(filepath: str) -> dict:
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_state(filepath: str, data: dict):
+    try:
+        with open(filepath, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+# --- CORS RESPONSE WRAPPER FOR ERRORS & INTERCEPTIONS ---
+def make_cors_response(content: str, status_code: int, retry_after: Optional[int] = None) -> Response:
+    res = Response(content=content, status_code=status_code)
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    res.headers["Access-Control-Allow-Headers"] = "*"
+    res.headers["Access-Control-Allow-Methods"] = "*"
+    res.headers["Access-Control-Expose-Headers"] = "Retry-After"
+    if retry_after is not None:
+        res.headers["Retry-After"] = str(retry_after)
+    return res
+
+# --- RATE LIMIT MIDDLEWARE ---
 @app.middleware("http")
 async def rate_limiter(request, call_next):
-    # 1. ALWAYS let browser preflight OPTIONS requests pass immediately
+    # Always let browser preflight OPTIONS checks slip through instantly
     if request.method == "OPTIONS":
         return await call_next(request)
         
     client_id = request.headers.get("X-Client-Id")
     if client_id:
         current_time = time.time()
-        if client_id not in rate_limit_store:
-            rate_limit_store[client_id] = []
-            
-        # Filter out timestamps older than 10 seconds
-        timestamps = [t for t in rate_limit_store[client_id] if current_time - t < RATE_LIMIT_WINDOW_SECS]
-        rate_limit_store[client_id] = timestamps
+        state = load_state(RATELIMIT_FILE)
         
-        # Check if client has exceeded the 18 requests threshold
+        timestamps = state.get(client_id, [])
+        # Keep only timestamps within the active sliding window
+        timestamps = [t for t in timestamps if current_time - t < RATE_LIMIT_WINDOW_SECS]
+        
         if len(timestamps) >= RATE_LIMIT_REQUESTS:
             oldest_request = timestamps[0]
             retry_after = max(1, int(RATE_LIMIT_WINDOW_SECS - (current_time - oldest_request)))
+            return make_cors_response("Rate limit exceeded.", 429, retry_after)
             
-            # Construct a raw text response with exact required headers
-            res = Response(
-                content="Too Many Requests. Rate limit exceeded.",
-                status_code=429
-            )
-            # Standard CORS headers
-            res.headers["Access-Control-Allow-Origin"] = "*"
-            res.headers["Access-Control-Allow-Headers"] = "*"
-            res.headers["Access-Control-Allow-Methods"] = "*"
-            
-            # The Rate Limiting headers the grader is looking for
-            res.headers["Retry-After"] = str(retry_after)
-            
-            # CRITICAL: Tell the browser it is safe to let JavaScript read the Retry-After header
-            res.headers["Access-Control-Expose-Headers"] = "Retry-After"
-            
-            return res
-            
-        # If under the limit, track the request time
-        rate_limit_store[client_id].append(current_time)
+        timestamps.append(current_time)
+        state[client_id] = timestamps
+        save_state(RATELIMIT_FILE, state)
 
-    return await call_next(request)
+    response = await call_next(request)
+    
+    # Inject full CORS headers to outbound successful responses
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "Retry-After"
+    return response
 
-# Standard CORS Middleware Catch-All
+# Standard Fallback CORS Middleware Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False, # Must be False if using wildcard "*" origins
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- 1. IDEMPOTENT ORDER CREATION ---
 @app.post("/orders", status_code=201)
-async def create_order(payload: OrderPayload, response: Response, idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
+async def create_order(payload: OrderPayload, idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
     if not idempotency_key:
-        raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
-    if idempotency_key in idempotency_store:
-        return {"id": idempotency_store[idempotency_key], "status": "completed", "duplicated": True}
+        return make_cors_response("Missing Idempotency-Key header", 400)
+        
+    state = load_state(IDEMPOTENCY_FILE)
+    
+    # If key exists, return the identical payload immediately
+    if idempotency_key in state:
+        return {
+            "id": state[idempotency_key],
+            "status": "completed",
+            "duplicated": True
+        }
+        
+    # Generate a new unique record order ID
     new_order_id = f"ord_{int(time.time() * 1000)}"
-    idempotency_store[idempotency_key] = new_order_id
-    return {"id": new_order_id, "status": "created", "duplicated": False}
+    state[idempotency_key] = new_order_id
+    save_state(IDEMPOTENCY_FILE, state)
+    
+    return {
+        "id": new_order_id,
+        "status": "created",
+        "duplicated": False
+    }
 
 # --- 2. CURSOR PAGINATION ---
 @app.get("/orders")
@@ -93,10 +130,16 @@ async def list_orders(limit: int = Query(default=10, ge=1), cursor: Optional[str
         try:
             start_index = int(cursor)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid cursor format")
+            return make_cors_response("Invalid cursor format", 400)
+            
     if start_index >= len(ORDERS_CATALOG):
         return {"items": [], "next_cursor": None}
+        
     end_index = start_index + limit
     sliced_items = ORDERS_CATALOG[start_index:end_index]
     next_cursor = str(end_index) if end_index < len(ORDERS_CATALOG) else None
-    return {"items": sliced_items, "next_cursor": next_cursor}
+    
+    return {
+        "items": sliced_items,
+        "next_cursor": next_cursor
+    }
